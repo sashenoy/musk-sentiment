@@ -1,0 +1,222 @@
+---
+title: "Supervised Machine Learning - Final Project"
+author: "Sanjna Shenoy"
+date: "12/21/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, warning = FALSE, message = FALSE, cache.lazy = FALSE)
+```
+
+# Using aggregated sentiment weights of Elon Musk's tweets to predict Tesla stock performance
+
+```{r, message=FALSE, include = FALSE}
+library(tibble)
+library(ggplot2)
+library(lubridate)
+library(stringi)
+library(stringr)
+library(tidytext)
+library(sentimentr)
+library(rtweet)
+library(caret)
+library(e1071)
+library(quantmod)
+library(kableExtra)
+```
+
+This project seeks to understand if a charismatic CEO's online presence has a significant impact on the performance of their company's stock. In a recent, controversial tweet, Tesla CEO Elon Musk announced he intended to take the company private, which eroded investor confidence and resulted in Tesla stock plummeting. 
+
+This topic is relevant because social media creates new avenues of managing investor relations, and it is important for a company, and a CEO to know how impactful Twitter can be.
+
+I hypothesize that tweets with positive sentiment weight have a beneficial impact on trading volume, whereas tweets with a negative sentiment weight have a detrimental impact.
+
+### Obtain and clean Data 
+```{r}
+musk <- read.csv("/Users/sanjnashenoy/Downloads/data_elonmusk.csv")
+tsla <- read.csv("/Users/sanjnashenoy/Downloads/TSLA.csv")
+musk <- as.tibble(musk)
+tsla <- as.tibble(tsla)
+```
+
+```{r, include=FALSE}
+app_name <- "musktweets"
+api_key <- "ghxrrKiLdlQIqNBPkRs9UAsYF"
+api_secret <- "EL4lGWjaLmHYn4uFSC1WCHedovg3JWTdcnRAtQlrrznvMZJ0hw"
+```
+
+```{r, eval = FALSE}
+twitter_token <- create_token(app = app_name, consumer_key = api_key, consumer_secret = api_secret)
+musk_tweets <- get_timeline("elonmusk", 3200)
+```
+The twitter limit prevents us from accessing more than 3200 tweets at a time, so we supplemented that dataset with tweets a Kaggle user had curated. This introduced a problem in our analysis, because we do not have a complete archive of Musk's tweets, including ones he may have deleted as is often the case with very controversial, and likely, most impactful tweets.
+
+Clean and organize the datasets:
+```{r}
+library(dplyr)
+tsla$Date <- as.Date(tsla$Date)
+tsla <- tsla %>%
+  dplyr::mutate(Diff = High-Low)
+
+musk$Tweet <- as.character(musk$Tweet)
+musk$Time <- as.Date(musk$Time)
+
+musk <- musk %>%
+  select(-c(row.ID, Retweet.from))
+musk <- dplyr::arrange(musk, Time)
+tsla <- dplyr::arrange(tsla, Date)
+colnames(musk)[2] <- "Date"
+musk$User <- as.character(musk$User)
+
+tsla$PctChange <- Delt(tsla$Volume, x2 = NULL, k = 1, type = c("arithmetic"))
+```
+### Some Plots
+
+Tesla closing price graph:
+```{r}
+ggplot(tsla, aes(x = Date)) + geom_line(aes(y = tsla$Close)) + labs(title = "Tesla Closing Price Change") + ylab("Tesla Closing Price")
+```
+Tesla volume change graph:
+
+```{r, warning=FALSE}
+ggplot(tsla, aes(x = Date)) + geom_line(aes(y = tsla$PctChange)) + labs(title = "Tesla Percentage change in Volume traded") + ylab("Volume Change")
+```
+
+Tesla volatility graph:
+```{r}
+ggplot(tsla, aes(x = Date)) + geom_line(aes(y = tsla$Diff)) + labs(title = "Difference between high and low") + ylab("Diff (Volatility)")
+```
+We see over time that Tesla volatility has increased, which conicides with the increased rate at which Elon Musk tweets from 2015 onwards. But this obviously does not imply causation.
+
+Clean tweets from the API:
+```{r, eval= FALSE}
+musk_tweets <- musk_tweets %>%
+  select(screen_name, text, created_at) %>%
+  arrange(created_at) %>%
+  as.tibble()
+colnames(musk_tweets) <- c("User","Tweet", "Date")
+musk_tweets$Date <- as.Date(musk_tweets$Date)
+```
+
+```{r, include=FALSE, message=FALSE, eval = FALSE}
+musk_tweets <- read.csv("/Users/sanjnashenoy/new_musk_tweets.csv")
+musk_tweets <- musk_tweets %>%
+  select(-X)
+ # I saved it to csv and now I'm calling it again
+```
+
+Merge into one dataset:
+```{r, warning=FALSE}
+musk_new <- full_join(musk, musk_tweets, by= "Tweet")
+musk_new <- musk_new %>%
+  select(-c(User.y, User.x)) %>%
+  as.tibble() %>%
+  mutate(User = "elonmusk")
+
+musk_new$Date.x[3219:6094] <- musk_new$Date.y[3219:6094]
+musk_new <- musk_new %>%
+  select(-Date.y)
+colnames(musk_new) <- c("Tweet", "Date", "User")
+```
+
+### Assign sentiment weights to Musk tweets
+```{r, warning=FALSE}
+remove_reg <- "&amp;|&lt;|&gt;"
+
+musk_new$Tweet <- stringi::stri_enc_toutf8(musk_new$Tweet, is_unknown_8bit=TRUE)
+musk_new<-as.data.frame(musk_new)
+
+tidy_tweets <- musk_new %>% 
+  filter(!str_detect(Tweet, "^RT")) %>%
+  mutate(text = str_remove_all(Tweet, remove_reg)) %>%
+  unnest_tokens(word, Tweet, token = "tweets") %>%
+  filter(!word %in% stop_words$word,
+         !word %in% str_remove_all(stop_words$word, "'"),
+         str_detect(word, "[a-z]"))
+
+tidy_tweets <- tibble::as.tibble(tidy_tweets)
+```
+
+```{r, message=FALSE}
+library(sentimentr)
+tweet_sentiment <- sentiment(tidy_tweets$word, polarity_dt = lexicon::hash_sentiment_jockers_rinker)
+new_sentiment <- tidy_tweets %>%
+  mutate(sentiment = tweet_sentiment$sentiment) %>%
+  group_by(text) %>%
+  mutate(weight = sum(sentiment))
+
+new_sentiment <- new_sentiment[!duplicated(new_sentiment$text),]
+dim(new_sentiment)
+names(new_sentiment)
+```
+
+```{r, warning=FALSE}
+mass_df <- inner_join(new_sentiment, tsla, by = 'Date')
+mass_df <- mass_df %>%
+  mutate(direction = sign(PctChange))
+mass_df$direction <- ifelse(mass_df$direction == 1, 1, 0)
+mass_df$direction <- factor(mass_df$direction)
+```
+Finally, the variables in our dataset are as follows:
+```{r}
+knitr::kable(names(mass_df), caption = "Variable Names") %>%
+  kable_styling(bootstrap="striped", full_width = F)
+```
+The dependent variable is the direction of percentage change, which measures if there has been an increase or decrease in volume traded over time. This variable is binary that we are interested in classifying.
+
+### Split data set into testing and training to check binary outcomes
+
+```{r, warning=FALSE}
+set.seed(12345L)
+in_train <- createDataPartition(mass_df$direction, p = 3/4, list = FALSE)
+training <- mass_df[in_train,]
+testing <- mass_df[-in_train,]
+```
+
+Logistic Regression:
+```{r}
+logit <- train(direction ~ weight, data = training, method = "glm", family =binomial(link = "logit"))
+y_hat <- predict(logit, testing)
+z <- factor(y_hat, levels = c(1, 0), labels = c("Up", "Down"))
+testing$direction <- factor(testing$direction, levels = c(1, 0), labels = c("Up", "Down"))
+confusionMatrix(z, testing$direction)
+```
+
+Linear Discriminant Analysis:
+```{r, error=TRUE}
+set.seed(12345L)
+in_train <- createDataPartition(mass_df$direction, p = 3/4, list = FALSE)
+training <- mass_df[in_train,]
+testing <- mass_df[-in_train,]
+
+LDA <- train(formula(logit), data = training, method = "lda", preProcess = c("center", "scale"))
+z <- predict(LDA, newdata = testing)
+z <- factor(z, levels = c(1, 0), labels = c("Up", "Down"))
+testing$direction <- factor(testing$direction, levels = c(1, 0), labels = c("Up", "Down"))
+confusionMatrix(predict(LDA, testing), testing$direction)
+```
+
+Quadratic Discriminant Analysis:
+```{r}
+set.seed(12345L)
+in_train <- createDataPartition(mass_df$direction, p = 3/4, list = FALSE)
+training <- mass_df[in_train,]
+testing <- mass_df[-in_train,]
+
+QDA <- train(formula(logit), data = training, method = "qda", preProcess = c("center", "scale"))
+z <- predict(QDA, newdata = testing)
+z <- factor(z, levels = c(1, 0), labels = c("Up", "Down"))
+testing$direction <- factor(testing$direction, levels = c(1, 0), labels = c("Up", "Down"))
+confusionMatrix(z, testing$direction)
+```
+
+For classification of binary outcomes, we see that the accuracy is better with the logistic regression model. However, our analysis indicates that the sentiment weight of a CEO's tweet is not likely to be a good predictor of the changes in traded volume.
+
+```{r, eval = FALSE}
+defaultSummary(data.frame(obs = testing$direction, pred = predict(logit, newdata = testing)))
+defaultSummary(data.frame(obs = testing$direction, pred = predict(LDA, newdata = testing)))
+defaultSummary(data.frame(obs = testing$direction, pred = predict(QDA, newdata = testing)))
+```
+
+Our analysis, time permitting, may be improved by introducing controls for exogenous factors like the Dow Jones Industrial Average (as a proxy for the health of the general economy) or New York Times headlines that specifiically mention "Tesla" so we can identify external events that can impact stock performance
